@@ -1,3 +1,10 @@
+## Add
+这个repo是我看bevformer代码的一些理解注释，如果有需要，可以参考
+
+[2023/8/13]：forward的注释基本添加
+
+---
+
 <div align="center">   
   
 # BEVFormer: a Cutting-edge Baseline for Camera-based Detection

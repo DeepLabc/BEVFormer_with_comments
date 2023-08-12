@@ -43,13 +43,14 @@ class BEVFormerEncoder(TransformerLayerSequence):
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
 
-        self.num_points_in_pillar = num_points_in_pillar
-        self.pc_range = pc_range
+        self.num_points_in_pillar = num_points_in_pillar # 每一个pillar的采样点
+        self.pc_range = pc_range # 真实世界距离
         self.fp16_enabled = False
 
     @staticmethod
     def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
         """Get the reference points used in SCA and TSA.
+           对应Figure2的(b)示意图
         Args:
             H, W: spatial shape of bev.
             Z: hight of pillar.
@@ -63,19 +64,25 @@ class BEVFormerEncoder(TransformerLayerSequence):
 
         # reference points in 3D space, used in spatial cross-attention (SCA)
         if dim == '3d':
+            # 生成3d坐标，维度拓展之后做了归一化，为了应用在不同尺度的特征上
+            # 0.5这一数值使采样点位于网格的中心，可以打印看一下
+            # zs: (4)->(4,1,1)->(4,200,200)
             zs = torch.linspace(0.5, Z - 0.5, num_points_in_pillar, dtype=dtype,
                                 device=device).view(-1, 1, 1).expand(num_points_in_pillar, H, W) / Z
             xs = torch.linspace(0.5, W - 0.5, W, dtype=dtype,
                                 device=device).view(1, 1, W).expand(num_points_in_pillar, H, W) / W
             ys = torch.linspace(0.5, H - 0.5, H, dtype=dtype,
                                 device=device).view(1, H, 1).expand(num_points_in_pillar, H, W) / H
-            ref_3d = torch.stack((xs, ys, zs), -1)
+            ref_3d = torch.stack((xs, ys, zs), -1)  # (4, 200, 200, 3)
+            # (4, 200, 200, 3)->(4, 3, 200*200)->(4, 200*200, 3)
             ref_3d = ref_3d.permute(0, 3, 1, 2).flatten(2).permute(0, 2, 1)
+            # (4, 200*200, 3)->(1, 4, 200*200, 3)->(bs，4, 200*200, 3)
             ref_3d = ref_3d[None].repeat(bs, 1, 1, 1)
             return ref_3d
 
         # reference points on 2D bev plane, used in temporal self-attention (TSA).
         elif dim == '2d':
+            # 跟3d采样差不多
             ref_y, ref_x = torch.meshgrid(
                 torch.linspace(
                     0.5, H - 0.5, H, dtype=dtype, device=device),
@@ -85,51 +92,69 @@ class BEVFormerEncoder(TransformerLayerSequence):
             ref_y = ref_y.reshape(-1)[None] / H
             ref_x = ref_x.reshape(-1)[None] / W
             ref_2d = torch.stack((ref_x, ref_y), -1)
+            # (1, 200*200, 2)->(bs, 200*200, 2)->(bs, 200*200, 1, 2)
             ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)
             return ref_2d
 
     # This function must use fp32!!!
     @force_fp32(apply_to=('reference_points', 'img_metas'))
-    def point_sampling(self, reference_points, pc_range,  img_metas):
+    def point_sampling(self, 
+            reference_points, # (bs，4, 200*200, 3)
+            pc_range,  # 
+            img_metas  # list[]
+        ):
 
+        # 这里的lidar2img用来将lidar坐标系转到图像坐标系，六个cameras （4，4）
         lidar2img = []
         for img_meta in img_metas:
             lidar2img.append(img_meta['lidar2img'])
         lidar2img = np.asarray(lidar2img)
-        lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4)
+        lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4) , N 为camera个数
         reference_points = reference_points.clone()
-
+        
+        # reference_points是归一化的，所以这里要进行缩放到真实位置
+        # eg: x=0.1, pc_range[3]=51.2, pc_range[0]=-51.2
+        # 最后 x = (102.4) * 0.1 + (-51.2) = -40.96
         reference_points[..., 0:1] = reference_points[..., 0:1] * \
             (pc_range[3] - pc_range[0]) + pc_range[0]
         reference_points[..., 1:2] = reference_points[..., 1:2] * \
             (pc_range[4] - pc_range[1]) + pc_range[1]
         reference_points[..., 2:3] = reference_points[..., 2:3] * \
             (pc_range[5] - pc_range[2]) + pc_range[2]
-
+        
+        # 增加一维全是1的tensor，方便做坐标转换 (bs，4, 200*200, 4)
+        # 第一个4表示pillar采样点个数，第二个是坐标的维度
+        # 一个点的坐标用4维表示，bev有200*200个网格，每个网格pillar采4个点
         reference_points = torch.cat(
             (reference_points, torch.ones_like(reference_points[..., :1])), -1)
-
+        
+        # (bs，4, 200*200, 4)->(4, bs, 200*200, 4)
         reference_points = reference_points.permute(1, 0, 2, 3)
         D, B, num_query = reference_points.size()[:3]
         num_cam = lidar2img.size(1)
-
+        
+        # (4, bs, 200*200, 4)->(4, bs, 1, 200*200, 4)->(4, bs, cam_num, 200*200, 4, 1)
         reference_points = reference_points.view(
             D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
-
+        # 统一转换矩阵也做维度复制拓展 (4, bs, cam_num, 200*200, 4, 4)
         lidar2img = lidar2img.view(
             1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
-
+        
+        # reference_points_cam 已经是图像坐标系下的点了 (4, bs, 6, 200*200, 4)
         reference_points_cam = torch.matmul(lidar2img.to(torch.float32),
                                             reference_points.to(torch.float32)).squeeze(-1)
         eps = 1e-5
-
+        # 是否大于eps来生成mask
         bev_mask = (reference_points_cam[..., 2:3] > eps)
+        # (4, bs, 6, 200*200, 2), (u，v) 为什么要/[..., 2:3]？
         reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
-
+        
+        # 坐标归一化
         reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
         reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
 
+        # 确保所有坐标在有效范围内，注意是[0,1]
         bev_mask = (bev_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)
                     & (reference_points_cam[..., 0:1] < 1.0)
@@ -139,8 +164,10 @@ class BEVFormerEncoder(TransformerLayerSequence):
         else:
             bev_mask = bev_mask.new_tensor(
                 np.nan_to_num(bev_mask.cpu().numpy()))
-
+        
+        # (4, bs, 6, 200*200, 2)->(6, bs, 200*200, 4, 2)
         reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
+        # (6, bs, 200*200, 4)
         bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
 
         return reference_points_cam, bev_mask
@@ -179,35 +206,47 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 [num_layers, num_query, bs, embed_dims].
         """
 
-        output = bev_query
+        output = bev_query  # (bev_h*bev_w, bs, dim)
         intermediate = []
-
+        
+        # 3d采样，就是在pillar中采样 dim=(bs，4, 200*200, 3)
         ref_3d = self.get_reference_points(
             bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
+        # 2d采样，ref_2d dim=(bs, 200*200, 1, 2)
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
-
+        
+        # 生成坐标后映射到图像坐标，(6, bs, 200*200, 4, 2)
         reference_points_cam, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, kwargs['img_metas'])
 
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
+        # 在之前的bev特征加上偏移量得到当前bev特征
         shift_ref_2d = ref_2d  # .clone()
-        shift_ref_2d += shift[:, None, None, :]
-
-        # (num_query, bs, embed_dims) -> (bs, num_query, embed_dims)
+        shift_ref_2d += shift[:, None, None, :]  
+        
+        # num_queries = bev_h*bev_w
+        # (bev_h*bev_w, bs, embed_dims) -> (bs, bev_h*bev_w, embed_dims)
         bev_query = bev_query.permute(1, 0, 2)
+        
+        # (bev_h*bev_w, bs, embed_dims) -> (bs, bev_h*bev_w, embed_dims)
         bev_pos = bev_pos.permute(1, 0, 2)
         bs, len_bev, num_bev_level, _ = ref_2d.shape
         if prev_bev is not None:
+            # 如果之前的bev特征不为None,将其和当前的bev query拼接起来
             prev_bev = prev_bev.permute(1, 0, 2)
+            # (2 * bs, bev_h*bev_w, embed_dims)
             prev_bev = torch.stack(
                 [prev_bev, bev_query], 1).reshape(bs*2, len_bev, -1)
+            # 坐标也是同样操作
             hybird_ref_2d = torch.stack([shift_ref_2d, ref_2d], 1).reshape(
                 bs*2, len_bev, num_bev_level, 2)
         else:
+            # 如果pre bev不存在，坐标是两个相同的tensor, 很好理解
             hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
                 bs*2, len_bev, num_bev_level, 2)
-
+        
+        # 开始进入BEVFormerLayer
         for lid, layer in enumerate(self.layers):
             output = layer(
                 bev_query,
@@ -331,11 +370,14 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
         Returns:
             Tensor: forwarded results with shape [num_queries, bs, embed_dims].
         """
-
+        # 可以先跳到projects/mmdet3d_plugin/bevformer/modules/custom_base_transformer_layer.py看具体定义
+        
+        # 根据index找到对应的配置
         norm_index = 0
         attn_index = 0
         ffn_index = 0
         identity = query
+        # atten_masks的预处理
         if attn_masks is None:
             attn_masks = [None for _ in range(self.num_attn)]
         elif isinstance(attn_masks, torch.Tensor):
@@ -352,6 +394,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
 
         for layer in self.operation_order:
             # temporal self attention
+            # 实现在projects/mmdet3d_plugin/bevformer/modules/temporal_self_attention.py
             if layer == 'self_attn':
 
                 query = self.attentions[attn_index](
@@ -376,6 +419,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                 norm_index += 1
 
             # spaital cross attention
+            # 跳到 projects/mmdet3d_plugin/bevformer/modules/spatial_cross_attention.py
             elif layer == 'cross_attn':
                 query = self.attentions[attn_index](
                     query,
@@ -400,7 +444,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     query, identity if self.pre_norm else None)
                 ffn_index += 1
 
-        return query
+        return query  # 返回BEV特征
 
 
 

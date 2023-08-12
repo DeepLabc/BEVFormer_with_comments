@@ -51,18 +51,22 @@ class BEVFormerHead(DETRHead):
                  bev_w=30,
                  **kwargs):
 
-        self.bev_h = bev_h
-        self.bev_w = bev_w
-        self.fp16_enabled = False
+        self.bev_h = bev_h  # 200 in paper
+        self.bev_w = bev_w  # 200 in paper
+        self.fp16_enabled = False  # 半精度训练
 
-        self.with_box_refine = with_box_refine
-        self.as_two_stage = as_two_stage
+        self.with_box_refine = with_box_refine # decoder中是否每一次都对bbox调整
+        self.as_two_stage = as_two_stage  # 
         if self.as_two_stage:
             transformer['as_two_stage'] = self.as_two_stage
+        
+        # (xc，yc，w，l，zc，h，rot.sin()，rot.cos()，vx，vy), 对应：
+        # [预测框中心位置的x方向偏移，预测框中心位置的y方向偏移，预测框的宽，预测框的长，预测框中心位置的z方向偏移，预测框的高，旋转角的正弦值，旋转角的余弦值，x方向速度，y方向速度]
         if 'code_size' in kwargs:
             self.code_size = kwargs['code_size']
         else:
             self.code_size = 10
+        # 计算loss的权重
         if code_weights is not None:
             self.code_weights = code_weights
         else:
@@ -71,8 +75,9 @@ class BEVFormerHead(DETRHead):
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
-        self.real_w = self.pc_range[3] - self.pc_range[0]
-        self.real_h = self.pc_range[4] - self.pc_range[1]
+        # [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+        self.real_w = self.pc_range[3] - self.pc_range[0]  # 102.4
+        self.real_h = self.pc_range[4] - self.pc_range[1]  # 102.4
         self.num_cls_fcs = num_cls_fcs - 1
         super(BEVFormerHead, self).__init__(
             *args, transformer=transformer, **kwargs)
@@ -81,7 +86,7 @@ class BEVFormerHead(DETRHead):
 
     def _init_layers(self):
         """Initialize classification branch and regression branch of head."""
-        cls_branch = []
+        cls_branch = [] # 类别预测分支
         for _ in range(self.num_reg_fcs):
             cls_branch.append(Linear(self.embed_dims, self.embed_dims))
             cls_branch.append(nn.LayerNorm(self.embed_dims))
@@ -89,7 +94,7 @@ class BEVFormerHead(DETRHead):
         cls_branch.append(Linear(self.embed_dims, self.cls_out_channels))
         fc_cls = nn.Sequential(*cls_branch)
 
-        reg_branch = []
+        reg_branch = [] # 回归框分支
         for _ in range(self.num_reg_fcs):
             reg_branch.append(Linear(self.embed_dims, self.embed_dims))
             reg_branch.append(nn.ReLU())
@@ -114,8 +119,11 @@ class BEVFormerHead(DETRHead):
                 [reg_branch for _ in range(num_pred)])
 
         if not self.as_two_stage:
+            # BEV Feature定义 200 * 200， 256
             self.bev_embedding = nn.Embedding(
                 self.bev_h * self.bev_w, self.embed_dims)
+            # query_embedding在decoder使用 dim=(900, 512)
+            # 为什么是512呢？根据后面的代码得知这里包含256的query和pos
             self.query_embedding = nn.Embedding(self.num_query,
                                                 self.embed_dims * 2)
 
@@ -152,9 +160,12 @@ class BEVFormerHead(DETRHead):
 
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=bev_queries.device).to(dtype)
+        # 添加位置编码
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
-
-        if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
+        
+        # 根据bevformer train传进来的参数，only_bev=False
+        if only_bev:  
+            # only use encoder to obtain BEV features, TODO: refine the workaround
             return self.transformer.get_bev_features(
                 mlvl_feats,
                 bev_queries,
@@ -167,6 +178,8 @@ class BEVFormerHead(DETRHead):
                 prev_bev=prev_bev,
             )
         else:
+            # 跳到 projects/mmdet3d_plugin/bevformer/modules/transformer.py
+            # grid_length 表示没有bev网格代表的实际大小 eg：102.4/200
             outputs = self.transformer(
                 mlvl_feats,
                 bev_queries,
@@ -183,7 +196,7 @@ class BEVFormerHead(DETRHead):
         )
 
         bev_embed, hs, init_reference, inter_references = outputs
-        hs = hs.permute(0, 2, 1, 3)
+        hs = hs.permute(0, 2, 1, 3)  # decoder的中间层query
         outputs_classes = []
         outputs_coords = []
         for lvl in range(hs.shape[0]):
@@ -192,15 +205,18 @@ class BEVFormerHead(DETRHead):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
+            # 类别预测
             outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])
+            # 注意decoder里面使用了detach()，回归预测
+            tmp = self.reg_branches[lvl](hs[lvl]) 
 
             # TODO: check the shape of reference
             assert reference.shape[-1] == 3
             tmp[..., 0:2] += reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+            tmp[..., 0:2] = tmp[..., 0:2].sigmoid() # 归一化的x，y
             tmp[..., 4:5] += reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+            tmp[..., 4:5] = tmp[..., 4:5].sigmoid() # 归一化的z
+            # 根据pc_range缩放到真实世界
             tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
                              self.pc_range[0]) + self.pc_range[0])
             tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -

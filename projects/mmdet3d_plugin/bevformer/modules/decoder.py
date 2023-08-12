@@ -93,7 +93,8 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
         for lid, layer in enumerate(self.layers):
 
             reference_points_input = reference_points[..., :2].unsqueeze(
-                2)  # BS NUM_QUERY NUM_LEVEL 2
+                2)  # BS NUM_QUERY NUM_LEVEL 2 (bs, 900, 2，2)
+            # DetrTransformerDecoderLayer
             output = layer(
                 output,
                 *args,
@@ -102,27 +103,33 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 **kwargs)
             output = output.permute(1, 0, 2)
 
+            # 对decoder的输出进行回归框预测
             if reg_branches is not None:
+                # tmp: (xc，yc，w，l，zc，h，rot.sin()，rot.cos()，vx，vy)
                 tmp = reg_branches[lid](output)
 
                 assert reference_points.shape[-1] == 3
-
+                
+                # reference_point的值小于1，进行逆向激活得到实际坐标
                 new_reference_points = torch.zeros_like(reference_points)
                 new_reference_points[..., :2] = tmp[
-                    ..., :2] + inverse_sigmoid(reference_points[..., :2])
+                    ..., :2] + inverse_sigmoid(reference_points[..., :2])   # x, y
                 new_reference_points[..., 2:3] = tmp[
-                    ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])
-
+                    ..., 4:5] + inverse_sigmoid(reference_points[..., 2:3]) # z
+                
+                # 坐标归一化
                 new_reference_points = new_reference_points.sigmoid()
-
+                # 梯度截断，修正后的points作为下一个layer的reference_points, 越来越精确
                 reference_points = new_reference_points.detach()
 
-            output = output.permute(1, 0, 2)
+            output = output.permute(1, 0, 2) # 维度恢复进入下一个layer
             if self.return_intermediate:
+                # 保存中间层的特征\信息
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
+            # (layer_num, bs , 900, 256) (layer_num, bs, 900, 3)
             return torch.stack(intermediate), torch.stack(
                 intermediate_reference_points)
 

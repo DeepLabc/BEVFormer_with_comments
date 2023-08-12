@@ -49,6 +49,7 @@ class BEVFormer(MVXTwoStageDetector):
                              img_backbone, pts_backbone, img_neck, pts_neck,
                              pts_bbox_head, img_roi_head, img_rpn_head,
                              train_cfg, test_cfg, pretrained)
+        # GridMask随机mask掉特征
         self.grid_mask = GridMask(
             True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
@@ -78,24 +79,31 @@ class BEVFormer(MVXTwoStageDetector):
                 img.squeeze_()
             elif img.dim() == 5 and img.size(0) > 1:
                 B, N, C, H, W = img.size()
+                # 相当于batch size变大了，这种格式就是常见的CNN网络输入
                 img = img.reshape(B * N, C, H, W)
             if self.use_grid_mask:
+                # 是否使用网格擦除（特征增强）
                 img = self.grid_mask(img)
-
+            # ResNet 提取特征
             img_feats = self.img_backbone(img)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
             return None
         if self.with_img_neck:
+            # 是否使用类似FPN这样的Neck网络进一步处理特征
             img_feats = self.img_neck(img_feats)
 
-        img_feats_reshaped = []
+        # 假设每张img在backbone提取c1，c2，c3，c4三层特征
+        # len(img_feats_reshaped) = 4
+        img_feats_reshaped = [] 
         for img_feat in img_feats:
             BN, C, H, W = img_feat.size()
             if len_queue is not None:
+                # 提取pre_BEV特征的话恢复为 B，L-1, cam_num, C, H, W
                 img_feats_reshaped.append(img_feat.view(int(B/len_queue), len_queue, int(BN / B), C, H, W))
             else:
+                # B，cam_num, C, H, W
                 img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
         return img_feats_reshaped
 
@@ -129,10 +137,13 @@ class BEVFormer(MVXTwoStageDetector):
         Returns:
             dict: Losses of each branch.
         """
-
+        # point cloud branch？？？
+        # 重点在这个self.pts_bbox_head
+        # 切到projects/mmdet3d_plugin/bevformer/dense_heads/bevformer_head.py
         outs = self.pts_bbox_head(
-            pts_feats, img_metas, prev_bev)
+            pts_feats, img_metas, prev_bev) # type(outs)=dict
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        # 计算loss，继续看bevformer_head.py
         losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
         return losses
 
@@ -157,6 +168,8 @@ class BEVFormer(MVXTwoStageDetector):
     
     def obtain_history_bev(self, imgs_queue, img_metas_list):
         """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
+            获得之前时刻的BEV特征
+            这个函数不进行梯度回传，减少现存开销
         """
         self.eval()
 
@@ -214,16 +227,18 @@ class BEVFormer(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
         
-        len_queue = img.size(1)
-        prev_img = img[:, :-1, ...]
-        img = img[:, -1, ...]
+        len_queue = img.size(1)     # B, L, cam_num, C, H, W
+        prev_img = img[:, :-1, ...] # N, L-1, cam_num, C, H, W, 当前时刻的前面的序列
+        img = img[:, -1, ...]       # B, cam_num, C, H, W 当前时刻的六帧
 
         prev_img_metas = copy.deepcopy(img_metas)
+        # 获取之前时刻的BEV特征
         prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
 
         img_metas = [each[len_queue-1] for each in img_metas]
         if not img_metas[0]['prev_bev_exists']:
             prev_bev = None
+        # 提取当前时刻的img特征
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
         losses = dict()
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d,

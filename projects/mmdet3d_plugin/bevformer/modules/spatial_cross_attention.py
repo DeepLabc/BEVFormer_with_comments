@@ -128,13 +128,16 @@ class SpatialCrossAttention(BaseModule):
         if residual is None:
             inp_residual = query
             slots = torch.zeros_like(query)
+        # 添加position信息
         if query_pos is not None:
             query = query + query_pos
 
         bs, num_query, _ = query.size()
-
+        
+        # reference_points_cam (6, bs, 200*200, 4, 2)
         D = reference_points_cam.size(3)
         indexes = []
+        # 下面是Figure2 的（b）的实现，就是找到与采样点对应的camera(img)
         for i, mask_per_img in enumerate(bev_mask):
             index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
             indexes.append(index_query_per_img)
@@ -145,23 +148,25 @@ class SpatialCrossAttention(BaseModule):
             [bs, self.num_cams, max_len, self.embed_dims])
         reference_points_rebatch = reference_points_cam.new_zeros(
             [bs, self.num_cams, max_len, D, 2])
-        
+        # 得到有交集的query
         for j in range(bs):
             for i, reference_points_per_img in enumerate(reference_points_cam):   
                 index_query_per_img = indexes[i]
                 queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
                 reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
 
-        num_cams, l, bs, embed_dims = key.shape
-
+        num_cams, l, bs, embed_dims = key.shape  # l 就是h1*w2 + ... + h4*w4
+        
+        # (bs*6, H*W, 256)
         key = key.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
         value = value.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
-
+        # 同样使用deformable_attention
         queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
                                             reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
                                             level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
+        # 只更新有交集部分的query?
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
                 slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]

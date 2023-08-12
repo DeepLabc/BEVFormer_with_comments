@@ -84,7 +84,7 @@ class MyCustomBaseTransformerLayer(BaseModule):
                  init_cfg=None,
                  batch_first=True,
                  **kwargs):
-
+        # 调整参数的name
         deprecated_args = dict(
             feedforward_channels='feedforward_channels',
             ffn_dropout='ffn_drop',
@@ -108,7 +108,7 @@ class MyCustomBaseTransformerLayer(BaseModule):
             f' {self.__class__.__name__} should ' \
             f'contains all four operation type ' \
             f"{['self_attn', 'norm', 'ffn', 'cross_attn']}"
-
+        # 计算attention的个数，包括交叉注意力和自注意力
         num_attn = operation_order.count('self_attn') + operation_order.count(
             'cross_attn')
         if isinstance(attn_cfgs, dict):
@@ -119,15 +119,17 @@ class MyCustomBaseTransformerLayer(BaseModule):
                 f'not consistent with the number of attention' \
                 f'in operation_order {operation_order}.'
 
-        self.num_attn = num_attn
-        self.operation_order = operation_order
-        self.norm_cfg = norm_cfg
-        self.pre_norm = operation_order[0] == 'norm'
+        self.num_attn = num_attn                # 注意力层数
+        self.operation_order = operation_order  # 执行顺序
+        self.norm_cfg = norm_cfg                # layerNorm 的config
+        self.pre_norm = operation_order[0] == 'norm'  # layernorm在att之前还是之后
         self.attentions = ModuleList()
 
         index = 0
+        # 根据执行顺序build temporal和spatial attention模块，然后加入modulelist
         for operation_name in operation_order:
             if operation_name in ['self_attn', 'cross_attn']:
+                # batch size是否在第一维
                 if 'batch_first' in attn_cfgs[index]:
                     assert self.batch_first == attn_cfgs[index]['batch_first']
                 else:
@@ -140,7 +142,8 @@ class MyCustomBaseTransformerLayer(BaseModule):
                 index += 1
 
         self.embed_dims = self.attentions[0].embed_dims
-
+        
+        # FFN就不用多介绍了
         self.ffns = ModuleList()
         num_ffns = operation_order.count('ffn')
         if isinstance(ffn_cfgs, dict):
@@ -156,7 +159,7 @@ class MyCustomBaseTransformerLayer(BaseModule):
 
             self.ffns.append(
                 build_feedforward_network(ffn_cfgs[ffn_index]))
-
+        # layernorm
         self.norms = ModuleList()
         num_norms = operation_order.count('norm')
         for _ in range(num_norms):

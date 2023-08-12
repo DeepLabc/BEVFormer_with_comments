@@ -50,16 +50,17 @@ class PerceptionTransformer(BaseModule):
                  rotate_center=[100, 100],
                  **kwargs):
         super(PerceptionTransformer, self).__init__(**kwargs)
+        # build encoder和decoder
         self.encoder = build_transformer_layer_sequence(encoder)
         self.decoder = build_transformer_layer_sequence(decoder)
-        self.embed_dims = embed_dims
-        self.num_feature_levels = num_feature_levels
-        self.num_cams = num_cams
+        self.embed_dims = embed_dims                  # 256
+        self.num_feature_levels = num_feature_levels  # backbone 提取的特征层数
+        self.num_cams = num_cams                      # 相机个数，6
         self.fp16_enabled = False
 
-        self.rotate_prev_bev = rotate_prev_bev
-        self.use_shift = use_shift
-        self.use_can_bus = use_can_bus
+        self.rotate_prev_bev = rotate_prev_bev        # 对之前的bev特征旋转
+        self.use_shift = use_shift      # 偏移
+        self.use_can_bus = use_can_bus  # ？？
         self.can_bus_norm = can_bus_norm
         self.use_cams_embeds = use_cams_embeds
 
@@ -69,17 +70,22 @@ class PerceptionTransformer(BaseModule):
 
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
+        # 对每一个层多尺度特征添加了一个可学习参数
         self.level_embeds = nn.Parameter(torch.Tensor(
             self.num_feature_levels, self.embed_dims))
+        # 对每一个相机添加了一个可学习参数
         self.cams_embeds = nn.Parameter(
             torch.Tensor(self.num_cams, self.embed_dims))
+        # 生成参考点
         self.reference_points = nn.Linear(self.embed_dims, 3)
+        # 提取（学习）can bus特征
         self.can_bus_mlp = nn.Sequential(
             nn.Linear(18, self.embed_dims // 2),
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims // 2, self.embed_dims),
             nn.ReLU(inplace=True),
         )
+        # 是否做layerNorm
         if self.can_bus_norm:
             self.can_bus_mlp.add_module('norm', nn.LayerNorm(self.embed_dims))
 
@@ -116,16 +122,24 @@ class PerceptionTransformer(BaseModule):
         """
 
         bs = mlvl_feats[0].size(0)
-        bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
+        # bev_h=200, bev_w=200, dim=256
+        # (bev_h*bev_w, dim)->(bev_h*bev_w, 1, dim)->(bev_h * bev_w, bs, dim)
+        bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1) 
+        
+        # (bs, dim, bev_h, bev_w)->(bs, dim, bev_h*bev_w)->(bev_h*bev_w, bs, dim)
         bev_pos = bev_pos.flatten(2).permute(2, 0, 1)
 
+
         # obtain rotation angle and shift with ego motion
+        # 根据速度加速度等信息计算偏移量与pre_bev进行对齐
+        # 没看过数据集，具体can_bus可以对一下数据集
         delta_x = np.array([each['can_bus'][0]
                            for each in kwargs['img_metas']])
         delta_y = np.array([each['can_bus'][1]
                            for each in kwargs['img_metas']])
         ego_angle = np.array(
             [each['can_bus'][-2] / np.pi * 180 for each in kwargs['img_metas']])
+        # 前面提到grid_length表示每一个bev网格代表的实际距离
         grid_length_y = grid_length[0]
         grid_length_x = grid_length[1]
         translation_length = np.sqrt(delta_x ** 2 + delta_y ** 2)
@@ -144,6 +158,7 @@ class PerceptionTransformer(BaseModule):
             if prev_bev.shape[1] == bev_h * bev_w:
                 prev_bev = prev_bev.permute(1, 0, 2)
             if self.rotate_prev_bev:
+                # 考虑自车的旋转角度
                 for i in range(bs):
                     # num_prev_bev = prev_bev.size(1)
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
@@ -156,33 +171,47 @@ class PerceptionTransformer(BaseModule):
                     prev_bev[:, i] = tmp_prev_bev[:, 0]
 
         # add can bus signals
+        # can bus是什么？
         can_bus = bev_queries.new_tensor(
             [each['can_bus'] for each in kwargs['img_metas']])  # [:, :]
         can_bus = self.can_bus_mlp(can_bus)[None, :, :]
+        # bev特征 + can bus特征
         bev_queries = bev_queries + can_bus * self.use_can_bus
 
         feat_flatten = []
         spatial_shapes = []
+        # 开始对每一层多尺度特征进行处理
         for lvl, feat in enumerate(mlvl_feats):
             bs, num_cam, c, h, w = feat.shape
-            spatial_shape = (h, w)
+            # 当前特征的大小
+            spatial_shape = (h, w) 
+            # (bs, num_cam, c, h, w)->(bs, num_cam, c, h*w)->(num_cam, bs, h*w, c), c=256
             feat = feat.flatten(3).permute(1, 0, 3, 2)
             if self.use_cams_embeds:
+                # 加上相机embedding,为了区分不同的相机
                 feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
+            # 加上level的embedding (1, 1, 1, 256)
             feat = feat + self.level_embeds[None,
                                             None, lvl:lvl + 1, :].to(feat.dtype)
             spatial_shapes.append(spatial_shape)
             feat_flatten.append(feat)
 
+        # len(feat_flatten) = 4, 每一个特征的维度为 (num_cam, bs, h*w, c)
+        # (num_cam, bs, h1*w2 + ... + h4*w4, c)
         feat_flatten = torch.cat(feat_flatten, 2)
+        # spatial_shapes 维度为 (level, 2)
         spatial_shapes = torch.as_tensor(
             spatial_shapes, dtype=torch.long, device=bev_pos.device)
+        # 根据每一层的h,w就可以算出特征的起点，作用于feat_flatten的第二位
         level_start_index = torch.cat((spatial_shapes.new_zeros(
             (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-
-        feat_flatten = feat_flatten.permute(
-            0, 2, 1, 3)  # (num_cam, H*W, bs, embed_dims)
-
+        
+        # h1*w2 + ... + h4*w4 = H*W
+        # (num_cam, bs, H*W, c) -> (num_cam, H*W, bs, c)
+        feat_flatten = feat_flatten.permute(0, 2, 1, 3)
+        
+        # 开始进入encoder
+        # 转到 projects/mmdet3d_plugin/bevformer/modules/encoder.py
         bev_embed = self.encoder(
             bev_queries,
             feat_flatten,
@@ -248,7 +277,7 @@ class PerceptionTransformer(BaseModule):
                     be returned when `as_two_stage` is True, \
                     otherwise None.
         """
-
+        # 获得bev特征
         bev_embed = self.get_bev_features(
             mlvl_feats,
             bev_queries,
@@ -262,16 +291,19 @@ class PerceptionTransformer(BaseModule):
         bs = mlvl_feats[0].size(0)
         query_pos, query = torch.split(
             object_query_embed, self.embed_dims, dim=1)
+        # (900, 256)->(1, 900, 256)->(bs, 900, 256)
         query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
         query = query.unsqueeze(0).expand(bs, -1, -1)
-        reference_points = self.reference_points(query_pos)
+        # query_pos是一个可学习的embedding 
+        reference_points = self.reference_points(query_pos)  # (bs, 900, 3) x,y,z
         reference_points = reference_points.sigmoid()
         init_reference_out = reference_points
 
-        query = query.permute(1, 0, 2)
-        query_pos = query_pos.permute(1, 0, 2)
-        bev_embed = bev_embed.permute(1, 0, 2)
-
+        query = query.permute(1, 0, 2)          # (900, bs, 256)
+        query_pos = query_pos.permute(1, 0, 2)  # (900, bs, 256)
+        bev_embed = bev_embed.permute(1, 0, 2)  # (bs, 200*200, 256)
+        
+        # 切到projects/mmdet3d_plugin/bevformer/modules/decoder.py
         inter_states, inter_references = self.decoder(
             query=query,
             key=None,
@@ -285,5 +317,9 @@ class PerceptionTransformer(BaseModule):
             **kwargs)
 
         inter_references_out = inter_references
-
+        
+        # bev_embed: bev特征
+        # inter_states: decoder的中间or最后的输出，就是query
+        # init_reference_out: 最开始的位置信息
+        # inter_references_out: decoder的reference_points的信息
         return bev_embed, inter_states, init_reference_out, inter_references_out
